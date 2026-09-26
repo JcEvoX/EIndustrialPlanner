@@ -13,6 +13,10 @@
  * 原因：物料平衡树无法表达多配方环（如 crystal_shell ↔ crystal_powder、植物自增环），会把环内物品静默标成缺口。
  * 新行为：L2 改为自研线性规划内核（./lp/simplex.ts + ./lp/region-lp.ts），同时表达「区域自然资源上限」与「基地面积预算」双重约束，
  * 目标函数为「价值/分钟最大」，基线为「每种可生产券物品 ≥ targetPerMinute」。
+ *
+ * AI-CORRECTION 2026-09-26: 第 9-10 行的「采掘设备作为普通设备参与求解」已失效。
+ * 原因：用户确认矿机、气矿机、水泵等采集设备放在基地之外，不占基地区域面积。
+ * 新行为：`自然资源采集` 配方不进入 LP 变量集合，不参与面积计算；其产物改由「区域共享资源池上限」供给。
  */
 
 import type { RegistryContract } from "@/domain/registry/registry-contract";
@@ -32,6 +36,7 @@ import {
 import {
   buildRegionLpVariables,
   resolveInfiniteSupplyItemIds,
+  resolveNaturalResourceItemIds,
   solveRegionLp,
   toProductionPlanningResult,
   type RegionLpOptions,
@@ -63,6 +68,7 @@ export interface RegionProductionOptions {
   /** 可占用面积预算（格）；缺省为基地可摆放面积。 */
   readonly areaBudget: number;
   /** 区域自然资源开采上限（每分钟）；缺省表示不设上限。 */
+  /** AI-CORRECTION 2026-09-26: 采集设备不再计入基地，本字段语义由「开采上限」变为「区域资源池外部供给上限」。 */
   readonly resourceLimits: ReadonlyMap<string, number>;
   readonly sourceConfig: ProductionPlanningSourceConfig;
 }
@@ -217,6 +223,7 @@ function buildSharedLpOptions(
     valueByItemId,
     resourceLimits: options.resourceLimits,
     infiniteItemIds: resolveInfiniteSupplyItemIds(index),
+    naturalResourceItemIds: resolveNaturalResourceItemIds(index),
     dumpableItemIds,
   };
 }

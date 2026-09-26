@@ -9,6 +9,11 @@
  * - 变量 x_r：某候选配方的设备台数（连续，非负）；
  * - 候选输入的 perMinute 已经是「单台设备满速」的每分钟流量，因此系数直接取该值；
  * - 目标一律最大化，minimize 目标通过取负实现。
+ *
+ * AI-CORRECTION 2026-09-26: 采集设备（矿机 / 气矿机 / 水泵）不再作为变量参与求解。
+ * 原因：用户确认采集设备放在基地之外，不占基地区域面积；其产量以「区域共享资源池上限」表达。
+ * 新行为：带 `自然资源采集` tag 的配方从变量集合剔除，其产物转为带上限的外部供给（见 resolveExternalSupplyCap）。
+ * 该口径与 blueprint-planner/production-network.ts 的 normalizePlannerSources 一致（那一层同样把自然采集剥离为外供来源）。
  */
 
 import type { ProductionPlanningIndex, ProductionPlanningResult } from "@/app/shell/production-planning/production-planning-model";
@@ -22,6 +27,8 @@ import {
 const EPSILON = 1e-6;
 const NATURAL_RESOURCE_TAG = "自然资源";
 const INFINITE_SUPPLY_TAG = "无限供应";
+/** 采集类配方（矿机 / 气矿机 / 水泵）：设备放在基地之外，不占基地面积，产量即为区域资源池上限。 */
+const EXTRACTION_RECIPE_TAG = "自然资源采集";
 
 export interface RegionLpFlow {
   readonly itemId: string;
@@ -48,10 +55,12 @@ export interface RegionLpOptions {
   readonly targets: ReadonlyMap<string, number>;
   /** 物品调度券价值；未登记价值的物品按 0 计。 */
   readonly valueByItemId: ReadonlyMap<string, number>;
-  /** 区域自然资源开采上限（每分钟）；缺省表示不设上限。 */
+  /** 区域自然资源外部供给上限（每分钟）；缺省表示不设上限。 */
   readonly resourceLimits: ReadonlyMap<string, number>;
   /** 允许无限外部供给的物品（如清水、酸液）。 */
   readonly infiniteItemIds: ReadonlySet<string>;
+  /** 全部 `自然资源` 物品：一律由区域资源池供给，不要求基地内自平衡。 */
+  readonly naturalResourceItemIds: ReadonlySet<string>;
   /** 允许直接排放/输出的物品（如外部处理污水）。 */
   readonly dumpableItemIds: ReadonlySet<string>;
   /** 优化目标：value = 价值/分钟最大；area = 基线面积最小。 */
@@ -64,8 +73,8 @@ export interface RegionLpBuild {
   readonly itemIds: readonly string[];
   /** 物品 → 物料平衡约束行下标。 */
   readonly balanceRowByItem: ReadonlyMap<string, number>;
-  /** 自然资源物品 → 开采上限约束行下标。 */
-  readonly extractionRowByItem: ReadonlyMap<string, number>;
+  /** 由区域资源池供给（而非基地内生产）的物品，指标层据此标记为「外部输入」而非「缺口」。 */
+  readonly externalSupplyItemIds: ReadonlySet<string>;
   /** 基线约束行下标 → 物品 id。 */
   readonly baselineItems: readonly string[];
   readonly areaRowIndex: number;
@@ -89,16 +98,35 @@ export function resolveInfiniteSupplyItemIds(index: ProductionPlanningIndex): Se
   return result;
 }
 
-/** 判定物品是否为可配置开采上限的自然资源（有自然资源标签且非无限供应）。 */
-export function isConfigurableNaturalResource(index: ProductionPlanningIndex, itemId: string): boolean {
-  const item = index.itemById.get(itemId);
-  if (item === undefined) {
-    return false;
+/** 收集全部 `自然资源` 物品：采集设备在基地之外，这些物品一律由区域资源池供给。 */
+export function resolveNaturalResourceItemIds(index: ProductionPlanningIndex): Set<string> {
+  const result = new Set<string>();
+  for (const item of index.itemById.values()) {
+    if (item.tags.includes(NATURAL_RESOURCE_TAG)) {
+      result.add(item.id);
+    }
   }
-  return item.tags.includes(NATURAL_RESOURCE_TAG) && !item.tags.includes(INFINITE_SUPPLY_TAG);
+  return result;
 }
 
-/** 构造 LP 变量集合：地区索引内全部系统配方候选，每项对应一台满速设备。 */
+// AI-REMOVED 2026-09-26:
+// Reason: 该判定把「自然资源」与「是否可配置上限」绑在一起，无法表达「自然资源一律外供、上限可缺省」的口径。
+// Trigger: 武陵基线 LP 不可行 —— gas_inert 被拆罐回收配方顺带产出，于是被判成「必须自平衡」，外部供给记 0。
+// Evidence: .temp/.trash/region-probe/diag-wuling4.mjs 定位到 item_copper_jar / item_gas_inert 链。
+// Replacement: resolveNaturalResourceItemIds + resolveExternalSupplyCap 内的自然资源分支。
+// Risk: Low
+// Human Review: Required
+//
+// Original code:
+// export function isConfigurableNaturalResource(index: ProductionPlanningIndex, itemId: string): boolean {
+//   const item = index.itemById.get(itemId);
+//   if (item === undefined) {
+//     return false;
+//   }
+//   return item.tags.includes(NATURAL_RESOURCE_TAG) && !item.tags.includes(INFINITE_SUPPLY_TAG);
+// }
+
+/** 构造 LP 变量集合：地区索引内全部系统配方候选（剔除采集类），每项对应一台满速设备。 */
 export function buildRegionLpVariables(index: ProductionPlanningIndex): RegionLpVariable[] {
   const variables: RegionLpVariable[] = [];
   for (const candidate of index.candidateById.values()) {
@@ -106,7 +134,7 @@ export function buildRegionLpVariables(index: ProductionPlanningIndex): RegionLp
       continue;
     }
     const recipe = index.recipeById.get(candidate.recipeId);
-    if (recipe === undefined) {
+    if (recipe === undefined || recipe.tags.includes(EXTRACTION_RECIPE_TAG)) {
       continue;
     }
     const entity = index.entityById.get(recipe.machineId);
@@ -144,7 +172,7 @@ export function buildRegionLpVariables(index: ProductionPlanningIndex): RegionLp
 /**
  * 组装线性规划：
  * - 物料平衡：`消耗 - 生产 <= 外部供给`；内部中间物外部供给为 0，纯外部输入不设行；
- * - 开采上限：自然资源 `总生产 <= 区域上限`；
+ *   `自然资源` 一律由区域资源池供给，其外部供给即上限（采集设备不在基地内，产量由区域资源池给出）；
  * - 面积预算：`Σ 面积 × 台数 <= 预算`；
  * - 基线：可生产券物品 `生产 - 消耗 >= 目标速率`。
  */
@@ -170,7 +198,7 @@ export function buildRegionLp(
 
   const constraints: LinearConstraint[] = [];
   const balanceRowByItem = new Map<string, number>();
-  const extractionRowByItem = new Map<string, number>();
+  const externalSupplyItemIds = new Set<string>();
 
   // 1. 物料平衡行
   for (const itemId of itemIds) {
@@ -178,6 +206,9 @@ export function buildRegionLp(
       continue;
     }
     const externalCap = resolveExternalSupplyCap(itemId, options, producedByVariable);
+    if (externalCap > 0) {
+      externalSupplyItemIds.add(itemId);
+    }
     if (!Number.isFinite(externalCap)) {
       continue;
     }
@@ -200,33 +231,12 @@ export function buildRegionLp(
     constraints.push({ coefficients, relation: "<=", rhs: externalCap });
   }
 
-  // 2. 区域自然资源开采上限行
-  for (const [itemId, limit] of options.resourceLimits) {
-    if (!Number.isFinite(limit)) {
-      continue;
-    }
-    const coefficients = new Array<number>(variableCount).fill(0);
-    let touched = false;
-    for (let column = 0; column < variableCount; column++) {
-      const producedPerMinute = sumFlow(variables[column]!.produced, itemId);
-      if (producedPerMinute > EPSILON) {
-        coefficients[column] = producedPerMinute;
-        touched = true;
-      }
-    }
-    if (!touched) {
-      continue;
-    }
-    extractionRowByItem.set(itemId, constraints.length);
-    constraints.push({ coefficients, relation: "<=", rhs: limit });
-  }
-
-  // 3. 面积预算行
+  // 2. 面积预算行
   const areaCoefficients = variables.map((variable) => variable.deviceArea);
   const areaRowIndex = constraints.length;
   constraints.push({ coefficients: areaCoefficients, relation: "<=", rhs: options.areaBudget });
 
-  // 4. 基线行
+  // 3. 基线行
   const baselineItems: string[] = [];
   for (const [itemId, target] of options.targets) {
     if (target <= EPSILON) {
@@ -266,7 +276,7 @@ export function buildRegionLp(
     variables,
     itemIds,
     balanceRowByItem,
-    extractionRowByItem,
+    externalSupplyItemIds,
     baselineItems,
     areaRowIndex,
   };
@@ -288,8 +298,9 @@ export function solveRegionLp(
 }
 
 /**
- * 纯外部输入（无任何配方产出）允许无限供给；无限供应物与可排放物同理。
- * 其余物品的外部供给上限为 0，必须由内部生产自平衡。
+ * 无限供应物、可排放物、以及「无任何基地内配方产出」的物品允许无限外部供给；
+ * `自然资源` 一律由区域资源池供给：登记了上限就取上限，未登记则暂不设限；
+ * 其余物品上限为 0，必须由基地内生产自平衡。
  */
 function resolveExternalSupplyCap(
   itemId: string,
@@ -298,6 +309,10 @@ function resolveExternalSupplyCap(
 ): number {
   if (options.infiniteItemIds.has(itemId) || options.dumpableItemIds.has(itemId)) {
     return Number.POSITIVE_INFINITY;
+  }
+  if (options.naturalResourceItemIds.has(itemId)) {
+    const limit = options.resourceLimits.get(itemId);
+    return limit !== undefined && Number.isFinite(limit) ? limit : Number.POSITIVE_INFINITY;
   }
   if (!producedByVariable.has(itemId)) {
     return Number.POSITIVE_INFINITY;
@@ -365,12 +380,14 @@ export function toProductionPlanningResult(
     if (producedPerMinute <= EPSILON && demandPerMinute <= EPSILON) {
       continue;
     }
+    // 由区域资源池供给的物品（自然资源等）属于外部输入，其缺口不能记成「未满足需求」。
+    const externallySupplied = build.externalSupplyItemIds.has(itemId);
     itemTotals.push({
       itemId,
       demandPerMinute,
       suppliedPerMinute: producedPerMinute,
       producedPerMinute,
-      unresolvedPerMinute: Math.max(0, demandPerMinute - producedPerMinute),
+      unresolvedPerMinute: externallySupplied ? 0 : Math.max(0, demandPerMinute - producedPerMinute),
       isByproduct: producedPerMinute > EPSILON && demandPerMinute <= EPSILON,
     });
   }
