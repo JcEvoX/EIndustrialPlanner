@@ -3,6 +3,7 @@
  *
  * 用法：
  *   node src/scripts/region-production/run.mjs [--regions 武陵,四号谷地] [--target-per-minute 1]
+ *                                            [--high-value-threshold 25]
  *                                            [--resource-preset version-resource:wuling-1.5]
  *                                            [--out .temp/region-production]
  *
@@ -14,7 +15,11 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createRegistryContract } from "@/registry";
-import { analyzeRegion, createDefaultRegionProductionOptions } from "./region-plan";
+import {
+  analyzeRegion,
+  createDefaultRegionProductionOptions,
+  DEFAULT_HIGH_VALUE_THRESHOLD,
+} from "./region-plan";
 import { buildRegionReport, renderRegionMarkdown } from "./report";
 import { loadRegionResourcePresets, selectRegionResourceLimits } from "./region-resources";
 import { resolveRealBases } from "./region-scope";
@@ -22,6 +27,7 @@ import { resolveRealBases } from "./region-scope";
 interface CliOptions {
   readonly regions: readonly string[];
   readonly targetPerMinute: number;
+  readonly highValueThreshold: number;
   readonly resourcePresetId: string | undefined;
   readonly outDir: string;
 }
@@ -30,6 +36,7 @@ const HELP = [
   "区域产线建模脚本",
   "  --regions <tag,tag>        指定地区 tag（基地 tag，缺省：全部真实地区）",
   "  --target-per-minute <n>    全资源基础计划中每种物品的目标速率（缺省 1）",
+  `  --high-value-threshold <n> 参与最高价值计划的调度券价值门槛（缺省 ${DEFAULT_HIGH_VALUE_THRESHOLD}；0 = 不过滤）`,
   "  --resource-preset <id>     指定版本资源预设 id（缺省：按地区自动匹配）",
   "  --out <dir>                输出目录（缺省 .temp/region-production）",
 ].join("\n");
@@ -37,6 +44,7 @@ const HELP = [
 function parseArgs(argv: readonly string[]): CliOptions {
   let regions: string[] = [];
   let targetPerMinute = 1;
+  let highValueThreshold = DEFAULT_HIGH_VALUE_THRESHOLD;
   let resourcePresetId: string | undefined;
   let outDir = ".temp/region-production";
 
@@ -58,6 +66,12 @@ function parseArgs(argv: readonly string[]): CliOptions {
         throw new Error(`无效的 --target-per-minute：${value}`);
       }
       targetPerMinute = parsed;
+    } else if (key === "--high-value-threshold") {
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        throw new Error(`无效的 --high-value-threshold：${value}`);
+      }
+      highValueThreshold = parsed;
     } else if (key === "--resource-preset") {
       resourcePresetId = value;
     } else if (key === "--out") {
@@ -67,7 +81,7 @@ function parseArgs(argv: readonly string[]): CliOptions {
     }
   }
 
-  return { regions, targetPerMinute, resourcePresetId, outDir };
+  return { regions, targetPerMinute, highValueThreshold, resourcePresetId, outDir };
 }
 
 async function main(): Promise<void> {
@@ -92,6 +106,7 @@ async function main(): Promise<void> {
     const resourceLimits = selectRegionResourceLimits(presets, regionTag, cli.resourcePresetId);
     const options = createDefaultRegionProductionOptions(resourceLimits, {
       targetPerMinute: cli.targetPerMinute,
+      highValueThreshold: cli.highValueThreshold,
     });
     const analysis = analyzeRegion(registry, regionTag, bases, options, resourceLimits);
     const report = buildRegionReport(analysis);

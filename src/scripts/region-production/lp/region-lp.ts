@@ -66,8 +66,17 @@ export interface RegionLpOptions {
   readonly baseAreaBudget: ReadonlyMap<string, number>;
   /** 基线约束：物品净产出下限（每分钟）。 */
   readonly targets: ReadonlyMap<string, number>;
-  /** 物品调度券价值；未登记价值的物品按 0 计。 */
+  /** 物品调度券价值（全量）；未登记价值的物品按 0 计。只用于展示口径（如 shipped），不作为目标系数。 */
   readonly valueByItemId: ReadonlyMap<string, number>;
+  /**
+   * 目标函数用的价值系数：只包含达到「高价值门槛」的物品，门槛以下一律为 0。
+   *
+   * AI-CORRECTION 2026-09-26: 原实现把 valueByItemId 全量喂给目标函数，任何单位面积为正的产线
+   * 都值得建满，有限资源用尽后剩余面积必然被「低价值 + 无限原料」的产线填充（武陵因此多产
+   * 2239/min 的息壤）。新行为：低价值物品不参与最大化，剩余面积宁可留空也不堆低价值产线；
+   * 低价值物品仍受基线约束（每种可生产物品 >= 目标速率），也仍可作高价值产线的中间物/副产物产出。
+   */
+  readonly objectiveValueByItemId: ReadonlyMap<string, number>;
   /** 区域自然资源外部供给上限（每分钟）；缺省表示不设上限。 */
   readonly resourceLimits: ReadonlyMap<string, number>;
   /** 允许无限外部供给的物品（如清水、酸液）。 */
@@ -85,14 +94,25 @@ export interface RegionLpOptions {
    * 新行为：把「可排放」收敛为「净消耗 <= 0 的排放口」。
    */
   readonly dumpableItemIds: ReadonlySet<string>;
-  /** 优化目标：value = 价值/分钟最大；area = 基线面积最小。 */
-  readonly objective: "value" | "area";
+  /** 优化目标：value = 价值/分钟最大；balance = 最小基地利用率最大（均衡分摊）；area = 基线面积最小。 */
+  readonly objective: "value" | "area" | "balance";
   /**
    * 净值下界（调度券价值/分钟）：给定后追加 `Σ 净值 × 台数 >= valueFloor`。
    * 供词典序求解使用 —— 先求价值最优，再用该下界锁定价值、把目标切换为面积最小，
    * 从而在同价值解中取面积最小者，消除零价值设备（如净水节点）在退化解里的多重最优伪影。
    */
   readonly valueFloor?: number;
+  /**
+   * 面积上界（格，全区域合计）：给定后追加 `Σ 面积 × 台数 <= areaFloor`。
+   * 供词典序求解使用 —— 先锁定价值与面积最优，再在该解集内求均衡，
+   * 从而保证「均衡」不会通过新增低价值设备来提高最小利用率。
+   */
+  readonly areaFloor?: number;
+  /**
+   * 最小基地利用率下界：给定后追加 `t >= balanceFloor`（t 为均衡辅助变量，见 buildRegionLp）。
+   * 供词典序求解使用 —— 先求价值最优、再求均衡度最优，最后在该均衡度下最小化面积。
+   */
+  readonly balanceFloor?: number;
 }
 
 export interface RegionLpBuild {
@@ -212,13 +232,24 @@ export function buildRegionLpVariables(
  *   该行在区域级共享：同一地区多个基地共同消耗同一份资源上限；
  * - 面积预算：每基地一行 `Σ 该基地 面积 × 台数 <= 该基地预算`；
  * - 基线：可生产券物品 `生产 - 消耗 >= 目标速率`（区域级共享，不要求每个基地都产）；
- * - 净值下界（可选）：`Σ 净值 × 台数 >= valueFloor`，用于锁定价值后再最小化面积。
+ * - 净值下界（可选）：`Σ 目标净值 × 台数 >= valueFloor`，用于锁定价值后再最小化面积；
+ * - 面积上界（可选）：`Σ 面积 × 台数 <= areaFloor`，用于锁定面积最优后再求均衡，
+ *   使均衡不会靠新增低价值设备来提高最小利用率；
+ * - 均衡行（可选）：每基地一行 `Σ 该基地 面积 × 台数 >= 预算 × t`，等价于 `t <= 该基地利用率`；
+ *   t 是追加的辅助变量，目标为 balance 时最大化 t，即「最大化最小基地利用率」。该行只约束
+ *   面积在基地间的分布，不改变总价值最优性 —— 因此可在价值锁定后作为次目标使用。
+ *
+ * 列布局：[原始变量][均衡辅助变量 t（可选）]；t 列不影响 variables 与 deviceCounts 的对齐。
  */
 export function buildRegionLp(
   options: RegionLpOptions,
   variables: readonly RegionLpVariable[],
 ): RegionLpBuild {
   const variableCount = variables.length;
+  // t 列仅在需要均衡时追加：要么以均衡为目标，要么需要施加均衡度下界。
+  const usesBalanceColumn = options.objective === "balance" || options.balanceFloor !== undefined;
+  const balanceColumn = variableCount;
+  const totalColumns = variableCount + (usesBalanceColumn ? 1 : 0);
   // AI-REMOVED 2026-09-26:
   // Reason: producedByVariable 的唯一用途是「区域内无配方产出 → 无限外部供给」兜底，该兜底已按 fail-closed 移除。
   // Trigger: 用户确认 fail-closed 口径（区域内不可生产且未声明为资源池/无限供应的物品一律按 0）。
@@ -262,7 +293,7 @@ export function buildRegionLp(
     if (!Number.isFinite(externalCap)) {
       continue;
     }
-    const coefficients = new Array<number>(variableCount).fill(0);
+    const coefficients = new Array<number>(totalColumns).fill(0);
     let touched = false;
     for (let column = 0; column < variableCount; column++) {
       const variable = variables[column]!;
@@ -289,9 +320,13 @@ export function buildRegionLp(
     if (budget === undefined) {
       throw new Error(`缺少基地面积预算：${baseId}`);
     }
-    const coefficients = variables.map((variable) =>
-      variable.baseId === baseId ? variable.deviceArea : 0,
-    );
+    const coefficients = new Array<number>(totalColumns).fill(0);
+    for (let column = 0; column < variableCount; column++) {
+      const variable = variables[column]!;
+      if (variable.baseId === baseId) {
+        coefficients[column] = variable.deviceArea;
+      }
+    }
     areaRowByBaseId.set(baseId, constraints.length);
     constraints.push({ coefficients, relation: "<=", rhs: budget });
   }
@@ -302,7 +337,7 @@ export function buildRegionLp(
     if (target <= EPSILON) {
       continue;
     }
-    const coefficients = new Array<number>(variableCount).fill(0);
+    const coefficients = new Array<number>(totalColumns).fill(0);
     for (let column = 0; column < variableCount; column++) {
       const variable = variables[column]!;
       const net = sumFlow(variable.produced, itemId) - sumFlow(variable.consumed, itemId);
@@ -314,16 +349,16 @@ export function buildRegionLp(
     constraints.push({ coefficients, relation: ">=", rhs: target });
   }
 
-  // 4. 净值系数：两种目标都要用，先算一次；给定 valueFloor 时追加净值下界行（词典序第二目标）。
-  const valueCoefficients = new Array<number>(variableCount).fill(0);
+  // 4. 净值系数：两种目标都要用，先算一次；只累加达到高价值门槛的物品（见 objectiveValueByItemId）。
+  const valueCoefficients = new Array<number>(totalColumns).fill(0);
   for (let column = 0; column < variableCount; column++) {
     const variable = variables[column]!;
     let coefficient = 0;
     for (const flow of variable.produced) {
-      coefficient += (options.valueByItemId.get(flow.itemId) ?? 0) * flow.perMinute;
+      coefficient += (options.objectiveValueByItemId.get(flow.itemId) ?? 0) * flow.perMinute;
     }
     for (const flow of variable.consumed) {
-      coefficient -= (options.valueByItemId.get(flow.itemId) ?? 0) * flow.perMinute;
+      coefficient -= (options.objectiveValueByItemId.get(flow.itemId) ?? 0) * flow.perMinute;
     }
     valueCoefficients[column] = coefficient;
   }
@@ -331,14 +366,54 @@ export function buildRegionLp(
     constraints.push({ coefficients: valueCoefficients, relation: ">=", rhs: options.valueFloor });
   }
 
-  const objective = new Array<number>(variableCount).fill(0);
-  for (let column = 0; column < variableCount; column++) {
-    const variable = variables[column]!;
-    objective[column] = options.objective === "area" ? -variable.deviceArea : valueCoefficients[column]!;
+  // 面积上界：锁定面积最优后再求均衡，避免均衡靠新增设备提高最小利用率。
+  if (options.areaFloor !== undefined) {
+    const coefficients = new Array<number>(totalColumns).fill(0);
+    for (let column = 0; column < variableCount; column++) {
+      coefficients[column] = variables[column]!.deviceArea;
+    }
+    constraints.push({ coefficients, relation: "<=", rhs: options.areaFloor });
+  }
+
+  // 5. 均衡行：`t <= 该基地利用率` 写作 `Σ 面积 × 台数 - 预算 × t >= 0`（左侧取负后为 <= 形态）。
+  if (usesBalanceColumn) {
+    for (const baseId of baseIds) {
+      const budget = options.baseAreaBudget.get(baseId);
+      if (budget === undefined) {
+        throw new Error(`缺少基地面积预算：${baseId}`);
+      }
+      const coefficients = new Array<number>(totalColumns).fill(0);
+      for (let column = 0; column < variableCount; column++) {
+        const variable = variables[column]!;
+        if (variable.baseId === baseId) {
+          coefficients[column] = -variable.deviceArea;
+        }
+      }
+      coefficients[balanceColumn] = budget;
+      constraints.push({ coefficients, relation: "<=", rhs: 0 });
+    }
+    if (options.balanceFloor !== undefined) {
+      const coefficients = new Array<number>(totalColumns).fill(0);
+      coefficients[balanceColumn] = 1;
+      constraints.push({ coefficients, relation: ">=", rhs: options.balanceFloor });
+    }
+  }
+
+  const objective = new Array<number>(totalColumns).fill(0);
+  if (options.objective === "balance") {
+    objective[balanceColumn] = 1;
+  } else if (options.objective === "area") {
+    for (let column = 0; column < variableCount; column++) {
+      objective[column] = -variables[column]!.deviceArea;
+    }
+  } else {
+    for (let column = 0; column < variableCount; column++) {
+      objective[column] = valueCoefficients[column]!;
+    }
   }
 
   return {
-    program: { variableCount, constraints, objective },
+    program: { variableCount: totalColumns, constraints, objective },
     variables,
     itemIds,
     balanceRowByItem,

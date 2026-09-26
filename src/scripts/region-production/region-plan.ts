@@ -21,6 +21,12 @@
  * 原因：改用区域级 LP 直接求「价值/分钟最大」，不再依赖单位面积边际效率做贪心追加（排名仅作参考展示）。
  * 新行为：maxValue 由 solveMaxValuePlan 给出 —— 面积预算预留 EDA 整数化余量，价值最优后再取面积最小解；
  * overflow 仅描述相对基础计划多产出的最高价值物品。
+ *
+ * AI-CORRECTION 2026-09-26: 上述「价值/分钟最大」已收敛为「高价值物品价值/分钟最大」。
+ * 原因：全量价值等权累加时，任何单位面积为正的产线都值得建满，有限资源用尽后的剩余面积必然被
+ * 「低价值 + 无限原料」的产线填充（武陵因此多产 2239/min 的息壤，价值 1）。
+ * 新行为：目标只累加 value >= highValueThreshold 的物品（见 RegionProductionOptions），
+ * 且词典序由两层扩为三层 —— 价值 → 均衡 → 面积（均衡见 BaseAllocation 的基地分摊）。
  */
 
 import type { RegistryContract } from "@/domain/registry/registry-contract";
@@ -72,9 +78,25 @@ const ACID_ITEM_ID = "item_liquid_acid";
 /** 效率排名用单基地变量求解，给一个不会截断的最小面积搜索预算。 */
 const EFFICIENCY_AREA_BUDGET = 1e6;
 
+/**
+ * 默认高价值门槛（调度券价值）。
+ * 取 25：该值及以上是「优质 / 精选级成品」（四号谷地 6 种、武陵 5 种），
+ * 恰好把 1/2/3/10/16/22 的基础件与低级成品排除在目标之外。可经 CLI `--high-value-threshold` 覆盖。
+ */
+export const DEFAULT_HIGH_VALUE_THRESHOLD = 25;
+
 export interface RegionProductionOptions {
   /** 全资源基础计划中，每种物品的目标速率（每分钟）。 */
   readonly targetPerMinute: number;
+  /**
+   * 高价值门槛（调度券价值）：只有 value >= 该值的物品参与「最高价值计划」的目标函数。
+   * 门槛以下的物品仍受基线约束（每种可生产物品 >= targetPerMinute），也仍可作高价值产线的中间物
+   * 或副产物顺带产出，但不会为它们专门占用面积。
+   *
+   * 设 0 表示不做门槛过滤，恢复「所有券价值等权累加」的旧口径（有限资源用尽后剩余面积会被
+   * 低价值产线填满）。DEFAULT_HIGH_VALUE_THRESHOLD 为默认门槛，见 createDefaultRegionProductionOptions。
+   */
+  readonly highValueThreshold: number;
   /** 区域自然资源外部供给上限（每分钟）；按区域共享，来自版本资源预设。 */
   readonly resourceLimits: ReadonlyMap<string, number>;
   /** 版本资源预设声明的无限供给物品（如清水、沉积酸）。 */
@@ -100,6 +122,7 @@ export function createDefaultRegionProductionOptions(
 ): RegionProductionOptions {
   return {
     targetPerMinute: overrides.targetPerMinute ?? 1,
+    highValueThreshold: overrides.highValueThreshold ?? DEFAULT_HIGH_VALUE_THRESHOLD,
     resourceLimits: overrides.resourceLimits ?? resourceLimits?.limits ?? new Map<string, number>(),
     infiniteItemIds: overrides.infiniteItemIds ?? resourceLimits?.infiniteItemIds ?? new Set<string>(),
     sourceConfig: overrides.sourceConfig ?? { ...DEFAULT_SOURCE_CONFIG },
@@ -269,9 +292,17 @@ function buildSharedLpOptions(
   for (const itemId of options.infiniteItemIds) {
     infiniteItemIds.add(itemId);
   }
+  // 目标价值只保留达到门槛的物品：门槛以下系数为 0，求解器不会为其专门占用面积。
+  const objectiveValueByItemId = new Map<string, number>();
+  for (const [itemId, value] of valueByItemId) {
+    if (value > 0 && value >= options.highValueThreshold) {
+      objectiveValueByItemId.set(itemId, value);
+    }
+  }
   return {
     baseAreaBudget,
     valueByItemId,
+    objectiveValueByItemId,
     resourceLimits: options.resourceLimits,
     infiniteItemIds,
     naturalResourceItemIds: resolveNaturalResourceItemIds(index),
@@ -367,13 +398,22 @@ function subtractReserve(
 const AREA_TIGHTEN_ITERATIONS = 12;
 
 /**
- * 求「价值最大、同价值下面积最小」的规范化最优解，并保证该解经 EDA 整数化后仍放得下。
+ * 求「价值最大 → 面积最小 → 最小基地利用率最大」的规范化最优解，并保证该解经 EDA 整数化后仍放得下。
  *
- * 两级修正：
+ * 三级词典序 + 一级工程修正：
+ * - 价值层：目标为达到高价值门槛的物品净值最大（门槛见 RegionProductionOptions）；
+ * - 面积层：锁定价值下界后取占地最小解，消除零价值设备在多重最优解里出现的伪影；
+ * - 均衡层：锁定价值与面积后最大化「最小基地利用率」t（见 buildRegionLp 的均衡行），
+ *   把设备在等价最优解里摊到各基地，避免全塞进变量序靠前的那一个；
  * - 面积收紧：EDA 会把每个配方的台数向上取整成整数台（见 blueprint-planner/production-network.ts 的
  *   `Math.ceil(plan.deviceCount)`），连续解直接交给 EDA 必然超预算（原实现武陵为 14077 > 13900 格）。
  *   这里按「实际超出量」逐轮收紧面积预算并重解，直到整数化占地落在原预算内，避免过度预留。
- * - 面积次目标：价值相同时取占地最小解，消除零价值设备（净水节点等）在多重最优解里出现的伪影。
+ *
+ * AI-CORRECTION 2026-09-26: 原实现只有「价值 → 面积」两层，缺少均衡层，且面积层原本兼作末层。
+ * 原因：目标函数对基地无偏好，单纯形按列序取变量 —— 面积富余的四号谷地把全部设备塞进变量序
+ * 最前的协议核心区（241 台），其余三个基地为空；面积吃紧的武陵反而自然摊开。
+ * 新行为：均衡层排在面积层之后 —— 先锁死面积最优，再在「同价值同面积」的解集内最大化最小利用率。
+ * 该顺序是刻意的：若把均衡排在面积之前，均衡会靠新增低价值设备来抬高最空基地的利用率。
  */
 function solveMaxValuePlan(
   index: ProductionPlanningIndex,
@@ -383,13 +423,25 @@ function solveMaxValuePlan(
   let budget = new Map(lpOptions.baseAreaBudget);
   let overflow = new Map<string, number>();
   for (let iteration = 0; iteration < AREA_TIGHTEN_ITERATIONS; iteration++) {
-    // 价值下界给相对容差，避免浮点误差把价值最优解判成不可行。
-    const solved = solvePlan(index, variables, { ...lpOptions, baseAreaBudget: budget });
-    const canonical = solvePlan(index, variables, {
+    // 下界一律给相对容差，避免浮点误差把上一层的最优解判成不可行。
+    const valueSolved = solvePlan(index, variables, { ...lpOptions, baseAreaBudget: budget });
+    const valueFloor = valueSolved.objectiveValue
+      - (1e-6 + Math.abs(valueSolved.objectiveValue) * 1e-9);
+    const areaSolved = solvePlan(index, variables, {
       ...lpOptions,
       baseAreaBudget: budget,
       objective: "area",
-      valueFloor: solved.objectiveValue - (1e-6 + Math.abs(solved.objectiveValue) * 1e-9),
+      valueFloor,
+    });
+    // objective 为 area 时目标值是 `-占地格`，取负即连续最优面积。
+    const areaFloor = -areaSolved.objectiveValue
+      + (1e-6 + Math.abs(areaSolved.objectiveValue) * 1e-9);
+    const canonical = solvePlan(index, variables, {
+      ...lpOptions,
+      baseAreaBudget: budget,
+      objective: "balance",
+      valueFloor,
+      areaFloor,
     });
     overflow = resolveCeilOverflowByBase(canonical.deviceCounts, variables, lpOptions.baseAreaBudget);
     if (overflow.size === 0) {
