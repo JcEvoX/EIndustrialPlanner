@@ -17,7 +17,7 @@
     },
     {
       "itemId": "item_gas_inert",
-      "perMinute": 200
+      "perMinute": 460
     },
     {
       "itemId": "item_gas_xiranite",

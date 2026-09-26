@@ -10,7 +10,7 @@ import {
 } from "@/app/shell/module-balancing/version-resource-library";
 
 describe("version-resource-library", () => {
-  it("loads the public Wuling 1.4 and 1.5 resource presets with the 1.5 increases", () => {
+  it("loads the public Wuling 1.4/1.5 and Valley4 1.5 resource presets with AKEData limits", () => {
     const resourceRoot = resolve(process.cwd(), "public/module-balancing/version-resources");
     const index = normalizeVersionResourceIndex(JSON.parse(
       readFileSync(resolve(resourceRoot, "index.json"), "utf8"),
@@ -18,7 +18,7 @@ describe("version-resource-library", () => {
 
     expect(index).toEqual({
       version: "1",
-      resources: ["wuling-1.5", "wuling-1.4"],
+      resources: ["wuling-1.5", "wuling-1.4", "valley4-1.5"],
     });
 
     const wuling14 = normalizeVersionResourcePreset(JSON.parse(
@@ -26,6 +26,9 @@ describe("version-resource-library", () => {
     ));
     const wuling15 = normalizeVersionResourcePreset(JSON.parse(
       readFileSync(resolve(resourceRoot, "wuling-1.5.json"), "utf8"),
+    ));
+    const valley415 = normalizeVersionResourcePreset(JSON.parse(
+      readFileSync(resolve(resourceRoot, "valley4-1.5.json"), "utf8"),
     ));
 
     expect(wuling14?.inputs).toContainEqual({ itemId: "item_copper_ore", perMinute: 420 });
@@ -37,6 +40,17 @@ describe("version-resource-library", () => {
     });
     expect(wuling15?.inputs).toContainEqual({ itemId: "item_copper_ore", perMinute: 510 });
     expect(wuling15?.inputs).toContainEqual({ itemId: "item_gas_xiranite", perMinute: 150 });
+    // 惰气改为 AKEData 实算值 460/min（旧值 200/min 为估算，偏低）。
+    expect(wuling15?.inputs).toContainEqual({ itemId: "item_gas_inert", perMinute: 460 });
+    expect(valley415).toMatchObject({
+      id: "version-resource:valley4-1.5",
+      name: "四号谷地1.5版本资源",
+      regionTag: "四号谷地",
+    });
+    expect(valley415?.inputs).toContainEqual({ itemId: "item_originium_ore", perMinute: 560 });
+    expect(valley415?.inputs).toContainEqual({ itemId: "item_iron_ore", perMinute: 1080 });
+    expect(valley415?.inputs).toContainEqual({ itemId: "item_quartz_sand", perMinute: 240 });
+    expect(valley415?.inputs).toContainEqual({ itemId: "item_liquid_water", perMinute: 0, infinite: true });
   });
 
   it("normalizes a versioned index and finite or infinite resource inputs", () => {

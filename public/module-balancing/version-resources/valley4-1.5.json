@@ -1,0 +1,27 @@
+{
+  "id": "version-resource:valley4-1.5",
+  "name": "四号谷地1.5版本资源",
+  "regionTag": "四号谷地",
+  "inputs": [
+    {
+      "itemId": "item_originium_ore",
+      "perMinute": 560
+    },
+    {
+      "itemId": "item_iron_ore",
+      "perMinute": 1080
+    },
+    {
+      "itemId": "item_quartz_sand",
+      "perMinute": 240
+    },
+    {
+      "itemId": "item_liquid_water",
+      "infinite": true
+    },
+    {
+      "itemId": "item_liquid_acid",
+      "infinite": true
+    }
+  ]
+}

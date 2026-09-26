@@ -37,6 +37,8 @@ export interface RegionLpFlow {
 
 /** 单个 LP 变量：候选配方满速单机的净流量与工程属性。 */
 export interface RegionLpVariable {
+  /** 变量归属基地：同一配方在不同基地是不同变量，因为面积预算按基地独立核算。 */
+  readonly baseId: string;
   readonly candidateId: string;
   readonly recipeId: string;
   readonly machineId: string;
@@ -49,8 +51,19 @@ export interface RegionLpVariable {
 }
 
 export interface RegionLpOptions {
-  /** 可占用面积预算（格）。 */
-  readonly areaBudget: number;
+  // AI-REMOVED 2026-09-26:
+  // Reason: 单值面积预算无法表达「资源池按区域共享、面积按基地独立」的多基地统一求解。
+  // Trigger: 用户确认资源池按大区域共享，需「区域级统一求解后分摊」。
+  // Evidence: 版本资源预设的 regionTag 是区域级；基地级各自求解会按基地数量重复放大资源上限。
+  // Replacement: 下方 baseAreaBudget。
+  // Risk: Low
+  // Human Review: Required
+  //
+  // Original code:
+  // /** 可占用面积预算（格）。 */
+  // readonly areaBudget: number;
+  /** 每个基地的可占用面积预算（格）；缺该基地条目时求解直接报错，不静默按 0 处理。 */
+  readonly baseAreaBudget: ReadonlyMap<string, number>;
   /** 基线约束：物品净产出下限（每分钟）。 */
   readonly targets: ReadonlyMap<string, number>;
   /** 物品调度券价值；未登记价值的物品按 0 计。 */
@@ -61,10 +74,25 @@ export interface RegionLpOptions {
   readonly infiniteItemIds: ReadonlySet<string>;
   /** 全部 `自然资源` 物品：一律由区域资源池供给，不要求基地内自平衡。 */
   readonly naturalResourceItemIds: ReadonlySet<string>;
-  /** 允许直接排放/输出的物品（如外部处理污水）。 */
+  /**
+   * 可排放副产物（如外部处理污水）：只允许「产出过剩直接排掉」，不允许净消耗。
+   * 约束形态是 `消耗 - 生产 <= 0`，即基线必须由本地区配方产出。
+   *
+   * AI-CORRECTION 2026-09-26: 原语义为「无限外部供给」（平衡行直接跳过），
+   * 该口径允许从区域外凭空引入污水，净水节点因此把无限污水白转成壤晶废液，
+   * 武陵重息壤被放大到 620/min（污水外部输入合计 7 万/min）。污水并非 `自然资源`
+   * （registry 内只有水泵/集气泵/矿机带 `自然资源采集` tag），必须本地区自产。
+   * 新行为：把「可排放」收敛为「净消耗 <= 0 的排放口」。
+   */
   readonly dumpableItemIds: ReadonlySet<string>;
   /** 优化目标：value = 价值/分钟最大；area = 基线面积最小。 */
   readonly objective: "value" | "area";
+  /**
+   * 净值下界（调度券价值/分钟）：给定后追加 `Σ 净值 × 台数 >= valueFloor`。
+   * 供词典序求解使用 —— 先求价值最优，再用该下界锁定价值、把目标切换为面积最小，
+   * 从而在同价值解中取面积最小者，消除零价值设备（如净水节点）在退化解里的多重最优伪影。
+   */
+  readonly valueFloor?: number;
 }
 
 export interface RegionLpBuild {
@@ -77,7 +105,8 @@ export interface RegionLpBuild {
   readonly externalSupplyItemIds: ReadonlySet<string>;
   /** 基线约束行下标 → 物品 id。 */
   readonly baselineItems: readonly string[];
-  readonly areaRowIndex: number;
+  /** 基地 id → 该基地面积预算约束行下标。 */
+  readonly areaRowByBaseId: ReadonlyMap<string, number>;
 }
 
 export interface RegionLpResult {
@@ -126,8 +155,14 @@ export function resolveNaturalResourceItemIds(index: ProductionPlanningIndex): S
 //   return item.tags.includes(NATURAL_RESOURCE_TAG) && !item.tags.includes(INFINITE_SUPPLY_TAG);
 // }
 
-/** 构造 LP 变量集合：地区索引内全部系统配方候选（剔除采集类），每项对应一台满速设备。 */
-export function buildRegionLpVariables(index: ProductionPlanningIndex): RegionLpVariable[] {
+/**
+ * 构造某基地的 LP 变量集合：地区索引内全部系统配方候选（剔除采集类），每项对应一台满速设备。
+ * 同一地区内多个基地各调用一次，变量以 baseId 区分，从而在区域级 LP 内联立。
+ */
+export function buildRegionLpVariables(
+  index: ProductionPlanningIndex,
+  baseId: string,
+): RegionLpVariable[] {
   const variables: RegionLpVariable[] = [];
   for (const candidate of index.candidateById.values()) {
     if (candidate.sourceType !== "system-recipe" || candidate.recipeId === null) {
@@ -155,6 +190,7 @@ export function buildRegionLpVariables(index: ProductionPlanningIndex): RegionLp
       }
     }
     variables.push({
+      baseId,
       candidateId: candidate.id,
       recipeId: recipe.id,
       machineId: recipe.machineId,
@@ -173,20 +209,32 @@ export function buildRegionLpVariables(index: ProductionPlanningIndex): RegionLp
  * 组装线性规划：
  * - 物料平衡：`消耗 - 生产 <= 外部供给`；内部中间物外部供给为 0，纯外部输入不设行；
  *   `自然资源` 一律由区域资源池供给，其外部供给即上限（采集设备不在基地内，产量由区域资源池给出）；
- * - 面积预算：`Σ 面积 × 台数 <= 预算`；
- * - 基线：可生产券物品 `生产 - 消耗 >= 目标速率`。
+ *   该行在区域级共享：同一地区多个基地共同消耗同一份资源上限；
+ * - 面积预算：每基地一行 `Σ 该基地 面积 × 台数 <= 该基地预算`；
+ * - 基线：可生产券物品 `生产 - 消耗 >= 目标速率`（区域级共享，不要求每个基地都产）；
+ * - 净值下界（可选）：`Σ 净值 × 台数 >= valueFloor`，用于锁定价值后再最小化面积。
  */
 export function buildRegionLp(
   options: RegionLpOptions,
   variables: readonly RegionLpVariable[],
 ): RegionLpBuild {
   const variableCount = variables.length;
-  const producedByVariable = new Set<string>();
+  // AI-REMOVED 2026-09-26:
+  // Reason: producedByVariable 的唯一用途是「区域内无配方产出 → 无限外部供给」兜底，该兜底已按 fail-closed 移除。
+  // Trigger: 用户确认 fail-closed 口径（区域内不可生产且未声明为资源池/无限供应的物品一律按 0）。
+  // Evidence: 全文件仅 resolveExternalSupplyCap 读取该集合；原木（手采资源）因此被当成无限外供。
+  // Replacement: None；生产侧物品仍由下方 itemIdSet 维护（物料平衡行与指标层只依赖 itemIds）。
+  // Risk: Low
+  // Human Review: Required
+  //
+  // Original code:
+  // const producedByVariable = new Set<string>();
   const consumedByVariable = new Set<string>();
   const itemIdSet = new Set<string>();
   for (const variable of variables) {
     for (const flow of variable.produced) {
-      producedByVariable.add(flow.itemId);
+      // AI-REMOVED 2026-09-26: 随 producedByVariable 一并移除（已无消费方）；物品仍进入 itemIdSet。
+      // producedByVariable.add(flow.itemId);
       itemIdSet.add(flow.itemId);
     }
     for (const flow of variable.consumed) {
@@ -205,8 +253,10 @@ export function buildRegionLp(
     if (!consumedByVariable.has(itemId)) {
       continue;
     }
-    const externalCap = resolveExternalSupplyCap(itemId, options, producedByVariable);
-    if (externalCap > 0) {
+    // 可排放副产物（污水等）即使上限为 0 也不是「缺口」，需计入外部处置口径。
+    const isDumpable = options.dumpableItemIds.has(itemId);
+    const externalCap = resolveExternalSupplyCap(itemId, options);
+    if (externalCap > 0 || isDumpable) {
       externalSupplyItemIds.add(itemId);
     }
     if (!Number.isFinite(externalCap)) {
@@ -231,10 +281,20 @@ export function buildRegionLp(
     constraints.push({ coefficients, relation: "<=", rhs: externalCap });
   }
 
-  // 2. 面积预算行
-  const areaCoefficients = variables.map((variable) => variable.deviceArea);
-  const areaRowIndex = constraints.length;
-  constraints.push({ coefficients: areaCoefficients, relation: "<=", rhs: options.areaBudget });
+  // 2. 面积预算行：每个基地一行。资源上限区域共享，面积预算必须按基地独立核算。
+  const areaRowByBaseId = new Map<string, number>();
+  const baseIds = [...new Set(variables.map((variable) => variable.baseId))].sort();
+  for (const baseId of baseIds) {
+    const budget = options.baseAreaBudget.get(baseId);
+    if (budget === undefined) {
+      throw new Error(`缺少基地面积预算：${baseId}`);
+    }
+    const coefficients = variables.map((variable) =>
+      variable.baseId === baseId ? variable.deviceArea : 0,
+    );
+    areaRowByBaseId.set(baseId, constraints.length);
+    constraints.push({ coefficients, relation: "<=", rhs: budget });
+  }
 
   // 3. 基线行
   const baselineItems: string[] = [];
@@ -254,21 +314,27 @@ export function buildRegionLp(
     constraints.push({ coefficients, relation: ">=", rhs: target });
   }
 
+  // 4. 净值系数：两种目标都要用，先算一次；给定 valueFloor 时追加净值下界行（词典序第二目标）。
+  const valueCoefficients = new Array<number>(variableCount).fill(0);
+  for (let column = 0; column < variableCount; column++) {
+    const variable = variables[column]!;
+    let coefficient = 0;
+    for (const flow of variable.produced) {
+      coefficient += (options.valueByItemId.get(flow.itemId) ?? 0) * flow.perMinute;
+    }
+    for (const flow of variable.consumed) {
+      coefficient -= (options.valueByItemId.get(flow.itemId) ?? 0) * flow.perMinute;
+    }
+    valueCoefficients[column] = coefficient;
+  }
+  if (options.valueFloor !== undefined) {
+    constraints.push({ coefficients: valueCoefficients, relation: ">=", rhs: options.valueFloor });
+  }
+
   const objective = new Array<number>(variableCount).fill(0);
   for (let column = 0; column < variableCount; column++) {
     const variable = variables[column]!;
-    if (options.objective === "area") {
-      objective[column] = -variable.deviceArea;
-    } else {
-      let coefficient = 0;
-      for (const flow of variable.produced) {
-        coefficient += (options.valueByItemId.get(flow.itemId) ?? 0) * flow.perMinute;
-      }
-      for (const flow of variable.consumed) {
-        coefficient -= (options.valueByItemId.get(flow.itemId) ?? 0) * flow.perMinute;
-      }
-      objective[column] = coefficient;
-    }
+    objective[column] = options.objective === "area" ? -variable.deviceArea : valueCoefficients[column]!;
   }
 
   return {
@@ -278,15 +344,14 @@ export function buildRegionLp(
     balanceRowByItem,
     externalSupplyItemIds,
     baselineItems,
-    areaRowIndex,
+    areaRowByBaseId,
   };
 }
 
-/** 求解一次区域 LP。 */
+/** 求解一次区域 LP。variables 由调用方按参与基地展开（见 buildRegionLpVariables）。 */
 export function solveRegionLp(
-  index: ProductionPlanningIndex,
   options: RegionLpOptions,
-  variables: readonly RegionLpVariable[] = buildRegionLpVariables(index),
+  variables: readonly RegionLpVariable[],
 ): RegionLpResult {
   const build = buildRegionLp(options, variables);
   const solution = maximizeLinearProgram(build.program);
@@ -298,25 +363,53 @@ export function solveRegionLp(
 }
 
 /**
- * 无限供应物、可排放物、以及「无任何基地内配方产出」的物品允许无限外部供给；
+ * 无限供应物、可排放副产物、以及「无任何基地内配方产出」的物品按外部来源处理；
  * `自然资源` 一律由区域资源池供给：登记了上限就取上限，未登记则暂不设限；
  * 其余物品上限为 0，必须由基地内生产自平衡。
+ *
+ * AI-CORRECTION 2026-09-26: 可排放物不再返回 `Infinity`（旧行为等价于「无限外部供给」），
+ * 而是返回 0 —— 只允许产出过剩排放，不允许净消耗。理由见 RegionLpOptions.dumpableItemIds。
+ *
+ * AI-CORRECTION 2026-09-26: 首句「无任何基地内配方产出的物品按外部来源处理」已失效。
+ * 原因：该分支（原 `!producedByVariable.has(itemId) → Infinity`）等价于把区域内不可生产的物品
+ * 一律当成无限外供，原木（手采资源，AKEData 区域数据无产量）因此被无限供给。
+ * 新行为：fail-closed —— 未声明为资源池 / 无限供应 / 可排放的消耗项一律返回 0，
+ * 必须由区域内配方产出，否则该物品在求解中不可用。用户已确认该口径。
+ *
+ * AI-CORRECTION 2026-09-26: 第二句「未登记则暂不设限」已失效。
+ * `自然资源` 未在预设登记上限时同样按 0（同属 fail-closed 口径），不再给出无限供给。
  */
 function resolveExternalSupplyCap(
   itemId: string,
   options: RegionLpOptions,
-  producedByVariable: ReadonlySet<string>,
 ): number {
-  if (options.infiniteItemIds.has(itemId) || options.dumpableItemIds.has(itemId)) {
+  if (options.infiniteItemIds.has(itemId)) {
     return Number.POSITIVE_INFINITY;
+  }
+  if (options.dumpableItemIds.has(itemId)) {
+    return 0;
   }
   if (options.naturalResourceItemIds.has(itemId)) {
     const limit = options.resourceLimits.get(itemId);
-    return limit !== undefined && Number.isFinite(limit) ? limit : Number.POSITIVE_INFINITY;
+    // AI-CORRECTION 2026-09-26: 原实现「未登记上限 → 不设限」为反向兜底，与用户确认的
+    // fail-closed 口径冲突（`自然资源` 属于「区域内不可生产」，未声明为资源池即按 0）。
+    // 原因：预设漏登记某项自然资源时，该分支会静默给出无限供给，掩盖数据缺口。
+    // 新行为：自然资源未登记上限时返回 0，缺口在报告中显式暴露；登记了上限仍取上限。
+    // 风险：预设漏登记会从「静默无限」变为「计划不可行/缺口」，属预期的数据校验信号。
+    return limit !== undefined && Number.isFinite(limit) ? limit : 0;
   }
-  if (!producedByVariable.has(itemId)) {
-    return Number.POSITIVE_INFINITY;
-  }
+  // AI-REMOVED 2026-09-26:
+  // Reason: 「无基地内配方产出 → 无限外部供给」兜底与区域资源上限口径冲突（原木被无限外供）。
+  // Trigger: 用户确认 fail-closed：区域内不可生产且未声明为资源池/无限供应的物品一律按 0。
+  // Evidence: 全文件仅本函数读取 producedByVariable；AKEData 区域数据中没有 item_plant_tundra_wood。
+  // Replacement: 下方 `return 0`（严格闭口径）。
+  // Risk: Low —— 若后续新增需外供的中间物，必须显式登记到资源预设或无限供应集合，否则会被判为缺口。
+  // Human Review: Required
+  //
+  // Original code:
+  // if (!producedByVariable.has(itemId)) {
+  //   return Number.POSITIVE_INFINITY;
+  // }
   return 0;
 }
 
@@ -330,21 +423,31 @@ function sumFlow(flows: readonly RegionLpFlow[], itemId: string): number {
   return total;
 }
 
-/** 把 LP 解折算成生产规划结果，供既有指标层复用。 */
+/**
+ * 把 LP 解折算成生产规划结果，供既有指标层复用。
+ * 传入变量子集即可得到「该基地分摊结果」：区域级传全部变量，基地级传各自变量。
+ *
+ * mode 决定缺口口径：
+ * - `region`：只有区域资源池供给的物品不计缺口；
+ * - `base`：基地是区域的一部分，跨基地流转对该基地同样是外部输入，因此净进口一律不计缺口。
+ */
 export function toProductionPlanningResult(
-  build: RegionLpBuild,
+  variables: readonly RegionLpVariable[],
   deviceCounts: readonly number[],
+  itemIds: readonly string[],
+  externalSupplyItemIds: ReadonlySet<string>,
+  mode: "region" | "base" = "region",
 ): ProductionPlanningResult {
   const recipeTotals: ProductionPlanningResult["recipeTotals"] = [];
   const producedByItem = new Map<string, number>();
   const consumedByItem = new Map<string, number>();
 
-  for (let column = 0; column < build.variables.length; column++) {
+  for (let column = 0; column < variables.length; column++) {
     const deviceCount = deviceCounts[column] ?? 0;
     if (deviceCount <= EPSILON) {
       continue;
     }
-    const variable = build.variables[column]!;
+    const variable = variables[column]!;
     recipeTotals.push({
       candidateId: variable.candidateId,
       candidateSourceType: "system-recipe",
@@ -374,14 +477,16 @@ export function toProductionPlanningResult(
   }
 
   const itemTotals: ProductionPlanningResult["itemTotals"] = [];
-  for (const itemId of build.itemIds) {
+  for (const itemId of itemIds) {
     const producedPerMinute = producedByItem.get(itemId) ?? 0;
     const demandPerMinute = consumedByItem.get(itemId) ?? 0;
     if (producedPerMinute <= EPSILON && demandPerMinute <= EPSILON) {
       continue;
     }
-    // 由区域资源池供给的物品（自然资源等）属于外部输入，其缺口不能记成「未满足需求」。
-    const externallySupplied = build.externalSupplyItemIds.has(itemId);
+    // 由区域资源池供给的物品（自然资源等）属于外部输入，其缺口不能记成「未满足需求」；
+    // 基地口径下跨基地净进口同样由区域其他基地补足，也不算该基地的缺口。
+    const externallySupplied = externalSupplyItemIds.has(itemId)
+      || (mode === "base" && demandPerMinute > producedPerMinute + EPSILON);
     itemTotals.push({
       itemId,
       demandPerMinute,
