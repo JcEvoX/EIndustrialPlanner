@@ -13,6 +13,7 @@
     "test": "vitest run --project normal",
     "test:normal": "vitest run --project normal",
     "test:eda": "node src/scripts/run-eda.mjs",
+    "region-production": "node src/scripts/region-production/run.mjs",
     "test:blueprint": "vitest run --project blueprint",
     "test:e2e": "playwright test",
     "test:watch": "vitest",
