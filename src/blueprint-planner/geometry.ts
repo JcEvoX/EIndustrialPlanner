@@ -1,5 +1,5 @@
 import type { WorldEntity } from "@/domain/document/world-document";
-import type { EntityDefinition, EntityAcceptRuleDefinition } from "@/domain/registry/types/entity-definition";
+import type { EntityDefinition, EntityAcceptRuleDefinition, PortGroupDefinition, PortDefinition } from "@/domain/registry/types/entity-definition";
 import type { RegistryContract } from "@/domain/registry/registry-contract";
 import type { GridEdge, GridPoint, GridRotation } from "@/domain/shared/grid";
 import { hasDomain, ItemDomainFlag } from "@/domain/shared/item-domain-flags";
@@ -51,7 +51,7 @@ export function getPlannerPorts(
     if (storageGroupIds !== undefined && !definition.portStorageBindings.some((binding) =>
       binding.portGroupId === group.id && storageGroupIds.includes(binding.storageSlotGroupId))) return [];
     return group.ports.flatMap((port, portIndex) => {
-      if (itemId !== undefined && !acceptsItem(registry, port.acceptRule, itemId)) return [];
+      if (itemId !== undefined && !acceptsItem(registry, resolvePlannerPortAcceptRule(group, port, direction), itemId)) return [];
       const geometry = resolveRotatedPortGeometry({ footprint: definition.footprint, port, rotation: entity.rotation });
       const cell = { x: entity.position.x + geometry.cell.x, y: entity.position.y + geometry.cell.y };
       return [{
@@ -66,6 +66,27 @@ export function getPlannerPorts(
 
 export function opposite(edge: GridEdge): GridEdge { return EDGES[(EDGES.indexOf(edge) + 2) % 4]!; }
 export function cellKey(point: GridPoint): string { return `${point.x},${point.y}`; }
+
+/**
+ * 规划视角下的端口接收规则。
+ *
+ * AI-CORRECTION 2026-09-28: 反应池（mix_pool_1 / mix_pool_2）的输出端口在注册表中默认
+ * acceptRule 为 `{ kind: "none" }`，其语义是「输出过滤尚未配置」——仿真编译时把 none 解释为
+ * 「什么都不输出」，由规划器通过 restrictPort 为实际使用的输出端口写入 acceptRule 配置后才生效。
+ * 旧行为用注册表静态 acceptRule 直接筛选候选端口，导致反应池的输出端口对任何物品都返回空集，
+ * 布线阶段必然抛「设备端口运力不足」。
+ * 新行为：输出端口为 `none` 时按其端口组域（group.kind）参与筛选；输入端口保持原语义。
+ */
+function resolvePlannerPortAcceptRule(
+  group: PortGroupDefinition,
+  port: PortDefinition,
+  direction: "input" | "output",
+): EntityAcceptRuleDefinition {
+  if (direction === "output" && port.acceptRule.base.kind === "none") {
+    return { base: { kind: "domain", flags: group.kind }, exclude: port.acceptRule.exclude };
+  }
+  return port.acceptRule;
+}
 
 /** 从注册表端口推导形状及旋转，不保存另一份端口方向事实表。 */
 export function resolveTransportPose(
