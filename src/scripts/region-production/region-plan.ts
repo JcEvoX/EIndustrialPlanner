@@ -196,6 +196,13 @@ export interface RegionAnalysis {
   readonly maxValue: RegionMaxValuePlan;
   /** 区域最优配置按基地分摊。 */
   readonly allocations: readonly BaseAllocation[];
+  /**
+   * 区域全资源基础计划按基地分摊。
+   *
+   * 与 `allocations`（最高价值计划的基地分摊）并列：最高价值计划的定义是「用剩余面积追加产线」，
+   * 其面积占用天然贴着基地上限，无法整台落地为蓝图；基础计划密度低得多，是可落地的基地配置来源。
+   */
+  readonly baseAllocations: readonly BaseAllocation[];
   /** 求解范围内物品的显示名，供报告层直接渲染（如区域资源池条目）。 */
   readonly itemNameById: ReadonlyMap<string, string>;
 }
@@ -456,6 +463,28 @@ function solveMaxValuePlan(
   throw new Error(`面积收紧在 ${AREA_TIGHTEN_ITERATIONS} 轮内未收敛（${detail}）。`);
 }
 
+/**
+ * 全资源基础计划：先面积最小，再在「同面积最优」的解集内最大化最小基地利用率（均衡层）。
+ *
+ * AI-CORRECTION 2026-09-26: 原实现只做「面积最小」一层，多重最优解被单纯形按列序取变量 ——
+ * 面积富余的地区会把全部设备塞进变量序最前的协议核心区（武陵 base 计划 30 台全落协议核心区，
+ * 其余三个基地为空），无法为每个基地产出可落地的蓝图。
+ * 原因：目标函数对基地无偏好，最小面积解不唯一，单纯形只返回其中一个角点。
+ * 新行为：追加与 solveMaxValuePlan 同源的均衡层（第 3 层），面积锁定后把设备摊到各基地。
+ * 该层不改变基础计划的面积最优性 —— `areaFloor` 锁定为连续最小面积，均衡只能在等价解内重分布，
+ * 不能靠新增设备抬高最空基地的利用率。
+ */
+function solveBaselinePlan(
+  index: ProductionPlanningIndex,
+  variables: readonly RegionLpVariable[],
+  lpOptions: RegionLpOptions,
+): RegionSolve {
+  const areaSolved = solvePlan(index, variables, { ...lpOptions, objective: "area" });
+  const areaFloor = -areaSolved.objectiveValue
+    + (1e-6 + Math.abs(areaSolved.objectiveValue) * 1e-9);
+  return solvePlan(index, variables, { ...lpOptions, objective: "balance", areaFloor });
+}
+
 /** 各基地「整数化占地 - 原预算」的正超出量；无超出时不返回该基地。 */
 function resolveCeilOverflowByBase(
   deviceCounts: readonly number[],
@@ -550,7 +579,11 @@ export function computeValueEfficiencyRanking(
   shared: Omit<RegionLpOptions, "targets" | "objective">,
 ): ValueEfficiencyEntry[] {
   const probeBaseId = "__efficiency__";
-  const probeVariables = buildRegionLpVariables(index, probeBaseId);
+  const probeVariables = buildRegionLpVariables(
+    index,
+    probeBaseId,
+    options.sourceConfig.waterPurifierPolicy === "use-when-available",
+  );
   const probeShared = {
     ...shared,
     baseAreaBudget: new Map([[probeBaseId, EFFICIENCY_AREA_BUDGET]]),
@@ -693,18 +726,18 @@ export function analyzeRegion(
 
   const variables: RegionLpVariable[] = [];
   const baseAreaBudget = new Map<string, number>();
+  const includeWaterPurifier = options.sourceConfig.waterPurifierPolicy === "use-when-available";
   for (const base of bases) {
-    variables.push(...buildRegionLpVariables(index, base.id));
+    variables.push(...buildRegionLpVariables(index, base.id, includeWaterPurifier));
     baseAreaBudget.set(base.id, base.placeableArea.width * base.placeableArea.height);
   }
 
   const shared = buildSharedLpOptions(index, options, valueByItemId, baseAreaBudget);
   const baselineTargets = toRateMap(producible, options.targetPerMinute);
 
-  const allResource = solvePlan(index, variables, {
+  const allResource = solveBaselinePlan(index, variables, {
     ...shared,
     targets: baselineTargets,
-    objective: "area",
   });
 
   const valueRanking = computeValueEfficiencyRanking(index, producible, options, shared);
@@ -743,6 +776,7 @@ export function analyzeRegion(
       overflow: resolveOverflow(allResource.plan, maxValueSolve.plan, valueByItemId),
     },
     allocations: splitByBase(index, bases, maxValueSolve.build, maxValueSolve.deviceCounts, valueByItemId),
+    baseAllocations: splitByBase(index, bases, allResource.build, allResource.deviceCounts, valueByItemId),
     itemNameById,
   };
 }

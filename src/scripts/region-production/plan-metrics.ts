@@ -11,6 +11,7 @@ import type {
 } from "@/app/shell/production-planning/production-planning-model";
 import { STANDARD_TICK_RATE_PER_SECOND } from "@/simulation/contracts/tick-rate";
 import zhCnRegistry from "@/shared/i18n/zh-cn/registry";
+import { resolveLayoutDeviceArea } from "./layout-area";
 
 const EPSILON = 0.0001;
 
@@ -26,6 +27,8 @@ export interface MachineUsage {
   readonly footprintWidth: number;
   readonly footprintHeight: number;
   /** 占地（格）：向上取整的设备数 × 单机 footprint 面积。 */
+  // AI-CORRECTION 2026-09-28: 上述「单机 footprint 面积」已失效 —— 面积口径升级为布局占地
+  // （本体 + EDA 通道 + 物流倍率，见 layout-area.ts），与 LP 面积约束、整数化复核同口径。
   readonly area: number;
   readonly powerDemandPerTick: number;
 }
@@ -45,6 +48,8 @@ export interface ProductionPlanMetrics {
   readonly machineUsages: MachineUsage[];
   readonly totalDeviceCountCeil: number;
   /** 设备本体占地（格），不含传送带 / 管道；物流占地由布局层（EDA）决定。 */
+  // AI-CORRECTION 2026-09-28: 上述「设备本体占地，不含传送带 / 管道」已失效 —— 现在为布局占地
+  // （本体 + EDA 通道 + 物流倍率），用于与基地可摆放面积预算比较利用率，见 layout-area.ts。
   readonly deviceArea: number;
   readonly powerDemandPerTick: number;
   readonly powerDemandPerSecond: number;
@@ -88,7 +93,7 @@ export function computePlanMetrics(options: {
     const footprintWidth = entity?.footprint.width ?? 0;
     const footprintHeight = entity?.footprint.height ?? 0;
     const deviceCountCeil = Math.max(0, Math.ceil(deviceCount - EPSILON));
-    const area = deviceCountCeil * footprintWidth * footprintHeight;
+    const area = deviceCountCeil * resolveLayoutDeviceArea(footprintWidth, footprintHeight);
     const power = deviceCount * (entity?.powerDemand ?? 0);
     machineUsages.push({
       machineId,

@@ -17,12 +17,14 @@
  */
 
 import type { ProductionPlanningIndex, ProductionPlanningResult } from "@/app/shell/production-planning/production-planning-model";
+import { isWaterPurifierNodeRecipe } from "@/app/shell/production-planning/production-planning-model";
 import {
   maximizeLinearProgram,
   type LinearConstraint,
   type LinearProgram,
   type LinearProgramSolution,
 } from "./simplex";
+import { resolveLayoutDeviceArea } from "../layout-area";
 
 const EPSILON = 1e-6;
 const NATURAL_RESOURCE_TAG = "自然资源";
@@ -178,10 +180,15 @@ export function resolveNaturalResourceItemIds(index: ProductionPlanningIndex): S
 /**
  * 构造某基地的 LP 变量集合：地区索引内全部系统配方候选（剔除采集类），每项对应一台满速设备。
  * 同一地区内多个基地各调用一次，变量以 baseId 区分，从而在区域级 LP 内联立。
+ *
+ * `includeWaterPurifier` 与面板 `sourceConfig.waterPurifierPolicy` 对齐：默认关闭时排除净水节点配方
+ * （app 层同样默认排除，只有策略为「可用时使用」才由后处理追加）。若不排除，净水节点会以极小台数
+ * 出现在解里，而它在 blueprint-planner 中属于 `snap-to-outer-ring-edge` 设备、无法在空地上自动规划。
  */
 export function buildRegionLpVariables(
   index: ProductionPlanningIndex,
   baseId: string,
+  includeWaterPurifier = false,
 ): RegionLpVariable[] {
   const variables: RegionLpVariable[] = [];
   for (const candidate of index.candidateById.values()) {
@@ -192,11 +199,13 @@ export function buildRegionLpVariables(
     if (recipe === undefined || recipe.tags.includes(EXTRACTION_RECIPE_TAG)) {
       continue;
     }
+    if (!includeWaterPurifier && isWaterPurifierNodeRecipe(recipe)) {
+      continue;
+    }
     const entity = index.entityById.get(recipe.machineId);
     const footprintWidth = entity?.footprint.width ?? 0;
     const footprintHeight = entity?.footprint.height ?? 0;
-    // 面积系数必须为正，否则求解器可以无成本堆设备导致目标无界。
-    const deviceArea = footprintWidth > 0 && footprintHeight > 0 ? footprintWidth * footprintHeight : 1;
+    const deviceArea = resolveLayoutDeviceArea(footprintWidth, footprintHeight);
     const produced: RegionLpFlow[] = [];
     const consumed: RegionLpFlow[] = [];
     for (const output of candidate.outputs) {
