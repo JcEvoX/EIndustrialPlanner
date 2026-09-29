@@ -1,5 +1,6 @@
 import type { RegistryContract } from "@/domain/registry/registry-contract";
 import type { EntityAcceptRuleDefinition } from "@/domain/registry/types/entity-definition";
+import { normalizeAdmissionRateLimit } from "@/shared/registry/admission-rule";
 import { ItemDomainFlag } from "@/domain/shared/item-domain-flags";
 import { LOGISTICS_KIND } from "@/domain/shared/logistics";
 import { findLogisticsDevice, getPlannerPorts, transportCapacity, type PlannerPort } from "./geometry";
@@ -114,7 +115,7 @@ export async function wireProductionNetwork(registry: RegistryContract, network:
     const inlet = getPlannerPorts(registry, limiter.entity, definition, "input", itemId)[0]!;
     const outlet = getPlannerPorts(registry, limiter.entity, definition, "output", itemId)[0]!;
     limiter.entity.config[`portGroups[${inlet.groupIndex}].ports[${inlet.portIndex}].admissionRule`] = {
-      itemId, limit: null, perMinuteLimit: Math.ceil(rate / 6 - 1e-6) * 6,
+      itemId, limit: null, perMinuteLimit: normalizeAdmissionRateLimit(rate),
     };
     for (const connection of connections) if (samePort(connection.target, input.port)) connection.target = inlet;
     extraConnections.push({ source: outlet, target: input.port, amounts: new Map(input.amounts) });
@@ -158,6 +159,33 @@ export async function wireProductionNetwork(registry: RegistryContract, network:
     minimumCells: minimumAdmissionSpacing(network, connection),
   }));
 }
+
+// AI-REMOVED 2026-09-29:
+// Reason: 准入口速率归一化已上提为 shared 单一真源，避免「运行消耗/分支/供料审计」多处重复取整。
+// Trigger: 分支限速写入原始 rate 导致 rate<6 支路每窗额度为 0；修复后供料审计仍按原始 rate 比较而
+//   报「非均分支路没有完整准入口约束」，证明取整语义必须三处共用。
+// Evidence: simulation/dense/dense-simulation-kernel.ts 与 simulation/legacy/runtime-state.ts 的
+//   Math.floor(perMinuteLimit / ADMISSION_RATE_WINDOWS_PER_MINUTE)；src/blueprint-planner/supply-audit.ts 审计分支。
+// Replacement: src/shared/registry/admission-rule.ts 的 normalizeAdmissionRateLimit
+// Risk: Low（纯取整语义迁移，函数体逐字保留在 shared）
+// Human Review: Not Required
+//
+// Original code:
+// /**
+//  * 准入口速率上限（件/分钟），向上取整到 ADMISSION_RATE_WINDOWS_PER_MINUTE 的正整数倍。
+//  *
+//  * AI-CORRECTION 2026-09-29: expandSplitTree 原先把分支需求速率 rate（可为 5、1.33 等小数）
+//  * 直接写入 admissionRule.perMinuteLimit。运行时把该值均分到 ADMISSION_RATE_WINDOWS_PER_MINUTE
+//  * 个 10 秒窗口，每窗额度取 `Math.floor(perMinuteLimit / 6)`（见 simulation/legacy/runtime-state.ts
+//  * 的 readAdmissionRateWindowRemaining），因此 rate < 6 的支路每窗额度被下取整为 0，物品永远无法通过。
+//  * 现象：分支限速 5/6→0 使消费端被永久饿死（四号谷地·重建指挥部 filling rec_hp_1 因该支路停产，
+//  * 实测产量 0/min，整张蓝图验证失败）。
+//  * 新行为：与同文件「运行消耗端口」限速一致，统一用一个模块内函数把速率向上取整到不小于 rate 的
+//  * 6 的倍数，只可能放宽限速、不会收紧；注册表已约定 perMinuteLimit 必须是 6 的正整数倍。
+//  */
+// function resolveAdmissionRateLimit(rate: number): number {
+//   return Math.ceil(rate / ADMISSION_RATE_WINDOWS_PER_MINUTE - 1e-6) * ADMISSION_RATE_WINDOWS_PER_MINUTE;
+// }
 
 function minimumAdmissionSpacing(network: PlannerNetwork, connection: Connection): number {
   const source = network.nodes.find(node => node.entity.id === connection.source.entityId)!;
@@ -330,7 +358,7 @@ function expandSplitTree(registry: RegistryContract, network: PlannerNetwork, pl
     placement.placeAnywhere(limiter, 0, leaf.target.outside); network.nodes.push(limiter);
     const inlet = getPlannerPorts(registry, limiter.entity, definition, "input", itemId)[0]!;
     const outlet = getPlannerPorts(registry, limiter.entity, definition, "output", itemId)[0]!;
-    limiter.entity.config[`portGroups[${inlet.groupIndex}].ports[${inlet.portIndex}].admissionRule`] = { itemId, limit: null, perMinuteLimit: rate };
+    limiter.entity.config[`portGroups[${inlet.groupIndex}].ports[${inlet.portIndex}].admissionRule`] = { itemId, limit: null, perMinuteLimit: normalizeAdmissionRateLimit(rate) };
     connections.push({ source: outlet, target: leaf.target, amounts: new Map(leaf.amounts) });
     leaf.target = inlet;
     return;

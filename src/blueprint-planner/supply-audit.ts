@@ -1,4 +1,5 @@
 import type { RegistryContract } from "@/domain/registry/registry-contract";
+import { normalizeAdmissionRateLimit } from "@/shared/registry/admission-rule";
 import type { PlannerNetwork, PlannerWire } from "./model";
 import { PlannerCandidateError } from "./model";
 import type { PlannerRouter } from "./router";
@@ -37,7 +38,7 @@ export function auditPlannerSupply(registry: RegistryContract, network: PlannerN
       limit += rate;
       operatingLimits.set(wire.source.entityId, { entityId: wire.source.entityId, itemId: demand.itemId, perMinute: rate });
     }
-    if (limit > Math.ceil(demand.perMinute / 6 - 1e-6) * 6 + 1e-6) throw new PlannerCandidateError(`运行消耗准入口超出需求：${node.entity.id}`);
+    if (limit > normalizeAdmissionRateLimit(demand.perMinute) + 1e-6) throw new PlannerCandidateError(`运行消耗准入口超出需求：${node.entity.id}`);
   }
   let bufferedAdmissions = 0;
   for (const node of network.nodes) {
@@ -76,7 +77,9 @@ export function auditPlannerSupply(registry: RegistryContract, network: PlannerN
       if (visited.has(wire.target.entityId)) return false;
       const node = nodes.get(wire.target.entityId)!;
       const limit = wire.itemIds.length === 1 ? rateOf(node.entity.id, wire.itemIds[0]!) : null;
-      if (limit !== null) return limit <= wire.perMinute + 1e-6;
+      // AI-CORRECTION 2026-09-29: 限速被归一到 ADMISSION_RATE_WINDOWS_PER_MINUTE 的整数倍（运行时按窗口下取整，
+      // 见 shared/registry/admission-rule.ts），故比较基准同样取整到窗口倍数，否则 5→6 的归一化会被误判为「未受限」。
+      if (limit !== null) return limit <= normalizeAdmissionRateLimit(wire.perMinute) + 1e-6;
       if (!registry.queries.isGeneralLogisticsDevice(node.definition.id)) return false;
       const children = wires.filter(child => child.source.entityId === node.entity.id);
       return children.length > 0 && children.every(child => metered(child, new Set(visited).add(node.entity.id)));

@@ -477,7 +477,7 @@ function solveMaxValuePlan(
 function solveBaselinePlan(
   index: ProductionPlanningIndex,
   variables: readonly RegionLpVariable[],
-  lpOptions: RegionLpOptions,
+  lpOptions: Omit<RegionLpOptions, "objective">,
 ): RegionSolve {
   const areaSolved = solvePlan(index, variables, { ...lpOptions, objective: "area" });
   const areaFloor = -areaSolved.objectiveValue
