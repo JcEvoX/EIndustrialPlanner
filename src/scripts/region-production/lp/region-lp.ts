@@ -160,6 +160,59 @@ export function resolveNaturalResourceItemIds(index: ProductionPlanningIndex): S
   return result;
 }
 
+// AI-REMOVED 2026-10-01:
+// Reason: 「从资源池出发的图可达性闭包」口径过严，会把自增殖循环误判为不可达。
+// Trigger: 用户要求「按区域资源裁剪配方」后，武陵可产券物品由 12 种掉到 6 种，锦草软饮/芽针针剂/
+//   武陵电池被误判为缺口 —— 实测其链路是 种植机(锦草种子+清水→锦草 60/min) + 采种机(锦草→锦草种子)
+//   的自增殖环，净产出为正、可从 1 粒种子自举，但环内每个物品的图入边都不在源集合里，
+//   闭包判定必然失败。
+// Evidence: .temp/.trash/region-probe2/diag.mjs（列出不可达消耗项）、diag-item.mjs（打印两条互引配方）。
+// Replacement: region-plan.ts 的 probeRegionValuableItems —— 逐物品直接用 LP 判定可行性，与单位面积
+//   价值排名合并为同一轮探测（用同一批探针变量，不额外增加求解次数）。
+// Risk: Low —— 判定能力由「图可达」升级为「线性规划可行」，是严格更强者。
+// Human Review: Required
+//
+// Original code:
+// /**
+//  * 区域「可自平衡产出」的物品集合：从区域资源池出发做可达性闭包。
+//  *
+//  * 源集合 = 无限供应物品 ∪（`自然资源` ∩ 预设登记了正上限的物品）。可排放副产物不是源：
+//  * 其约束是「只许排放、不许净消耗」，消耗方必须由本区配方产出（见 resolveExternalSupplyCap）。
+//  * 迭代规则：某变量的消耗项全部可达时，其产出项一并可达；重复到不动点，从而正确处理配方环。
+//  *
+//  * 与 fail-closed 的 resolveExternalSupplyCap 同源：判定「某物品在本区能不能产」必须看资源
+//  * 可达性，而不是只看设备能不能摆 —— 否则会把「本区没有对应资源」的物品也算作可产，
+//  * 使其进入基线目标并把整条基线拖成不可行（见 region-plan.ts 的 solvePlan）。
+//  */
+// export function resolveResourceReachableItemIds(
+//   variables: readonly RegionLpVariable[],
+//   options: Pick<RegionLpOptions, "infiniteItemIds" | "naturalResourceItemIds" | "resourceLimits">,
+// ): Set<string> {
+//   const reachable = new Set<string>(options.infiniteItemIds);
+//   for (const itemId of options.naturalResourceItemIds) {
+//     const limit = options.resourceLimits.get(itemId);
+//     if (limit !== undefined && Number.isFinite(limit) && limit > 0) {
+//       reachable.add(itemId);
+//     }
+//   }
+//   let changed = true;
+//   while (changed) {
+//     changed = false;
+//     for (const variable of variables) {
+//       if (!variable.consumed.every((flow) => reachable.has(flow.itemId))) {
+//         continue;
+//       }
+//       for (const flow of variable.produced) {
+//         if (!reachable.has(flow.itemId)) {
+//           reachable.add(flow.itemId);
+//           changed = true;
+//         }
+//       }
+//     }
+//   }
+//   return reachable;
+// }
+
 // AI-REMOVED 2026-09-26:
 // Reason: 该判定把「自然资源」与「是否可配置上限」绑在一起，无法表达「自然资源一律外供、上限可缺省」的口径。
 // Trigger: 武陵基线 LP 不可行 —— gas_inert 被拆罐回收配方顺带产出，于是被判成「必须自平衡」，外部供给记 0。

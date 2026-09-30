@@ -52,6 +52,7 @@ import {
   toProductionPlanningResult,
   type RegionLpBuild,
   type RegionLpOptions,
+  type RegionLpResult,
   type RegionLpVariable,
 } from "./lp/region-lp";
 import {
@@ -220,23 +221,44 @@ export function createRegionProductionIndex(
   });
 }
 
-/** 区分「该地区可自动生产」与「该地区不可生产（配方/机器缺失）」的券价值物品。 */
-export function resolveProducibleValuableItems(
-  index: ProductionPlanningIndex,
-  valuable: readonly RegionValuableItem[],
-): { producible: RegionValuableItem[]; gaps: RegionValuableItem[] } {
-  const producible: RegionValuableItem[] = [];
-  const gaps: RegionValuableItem[] = [];
-  for (const item of valuable) {
-    const candidates = index.candidatesByOutputItem.get(item.itemId) ?? [];
-    if (candidates.some((candidate) => candidate.sourceType === "system-recipe")) {
-      producible.push(item);
-    } else {
-      gaps.push(item);
-    }
-  }
-  return { producible, gaps };
-}
+// AI-REMOVED 2026-10-01:
+// Reason: 该函数把「可产」判定与「可产性探测」割裂开 —— 判定只能靠静态条件（有配方 + 图可达），
+//   而图可达口径会把自增殖循环误判为不可达（见 lp/region-lp.ts 的 AI-REMOVED 记录）。
+// Trigger: 用户要求「按区域资源裁剪配方」后，武陵可产券物品由 12 种掉到 6 种（锦草软饮/芽针针剂/
+//   武陵电池被误判为缺口），基线保底随之丢失。
+// Evidence: .temp/.trash/region-probe2/ 下 diag.mjs / diag-item.mjs 实测；见 lp/region-lp.ts 同级记录。
+// Replacement: 下方 probeRegionValuableItems —— 直接用 LP 可行性判定，并与单位面积价值排名合并为同一轮探测。
+// Risk: Low
+// Human Review: Required
+//
+// Original code:
+// /**
+//  * 区分「该地区可自动生产」与「该地区不可生产」的券价值物品。
+//  *
+//  * AI-CORRECTION 2026-10-01: 原判定「有系统配方候选即可产」不成立，已追加资源可达性要求。
+//  * 原因：候选只校验设备可摆放（见 region-scope.ts 的地区裁剪），不校验配方链所需的资源能否在本区闭环。
+//  * 后果是「本区缺资源的券物品」也会被列为可产并进入基线目标，把整条基线拖成不可行。
+//  * 新行为：可产 = 本区存在系统配方候选 且 物品落在资源可达闭包内（见 resolveResourceReachableItemIds）；
+//  * 其余归入 gaps，报告层按「需跨区或外部供给」列出。
+//  */
+// export function resolveProducibleValuableItems(
+//   index: ProductionPlanningIndex,
+//   valuable: readonly RegionValuableItem[],
+//   reachableItemIds: ReadonlySet<string>,
+// ): { producible: RegionValuableItem[]; gaps: RegionValuableItem[] } {
+//   const producible: RegionValuableItem[] = [];
+//   const gaps: RegionValuableItem[] = [];
+//   for (const item of valuable) {
+//     const candidates = index.candidatesByOutputItem.get(item.itemId) ?? [];
+//     const hasRecipe = candidates.some((candidate) => candidate.sourceType === "system-recipe");
+//     if (hasRecipe && reachableItemIds.has(item.itemId)) {
+//       producible.push(item);
+//     } else {
+//       gaps.push(item);
+//     }
+//   }
+//   return { producible, gaps };
+// }
 
 // AI-REMOVED 2026-09-26:
 // Reason: 物料平衡树求解器无法表达多配方环，会把环内物品静默标成「缺口」，导致 EDA 报「原规划缺少物料来源」。
@@ -317,19 +339,52 @@ function buildSharedLpOptions(
   };
 }
 
-/** 求解一次区域线性规划并折算为 RegionPlan；基线不可行时退回无基线求解。 */
+/**
+ * 求解一次区域线性规划并折算为 RegionPlan。
+ *
+ * AI-CORRECTION 2026-10-01: 原行为「基线不可行时退回无基线求解」已失效。
+ * 原因：该降级是静默的 —— 只要有一个券物品在本区产不出来，「每种可产物品各 1/min」的保底会整体
+ *   消失且不报错，调用方与报告层都无法察觉；且它掩盖了真正的建模缺陷。
+ * 新行为：基线目标只包含本区可产的券物品（见 probeRegionValuableItems），因此基线在口径内必然可行；
+ *   若仍不可行，说明模型前提被破坏（如面积预算压到装不下保底产线），直接报错并带上基线目标条数。
+ */
 function solvePlan(
   index: ProductionPlanningIndex,
   variables: readonly RegionLpVariable[],
   lpOptions: RegionLpOptions,
 ): RegionSolve {
-  let attempt = solveRegionLp(lpOptions, variables);
-  if (attempt.solution.status !== "optimal" && lpOptions.targets.size > 0) {
-    attempt = solveRegionLp({ ...lpOptions, targets: new Map() }, variables);
-  }
+  const attempt = solveRegionLp(lpOptions, variables);
   if (attempt.solution.status !== "optimal") {
-    throw new Error(`区域线性规划未取得最优解：${attempt.solution.status}`);
+    const scope = lpOptions.targets.size > 0 ? `（基线目标 ${lpOptions.targets.size} 项）` : "";
+    throw new Error(`区域线性规划未取得最优解：${attempt.solution.status}${scope}`);
   }
+  // AI-REMOVED 2026-10-01:
+  // Reason: 该降级会在基线不可行时静默丢弃全部基线目标，使「保底不缺料」整体消失且无任何信号。
+  // Trigger: 用户确认「按区域资源裁剪配方」口径 —— 基线只应包含本区可产的券物品，
+  //   不可产者应显式暴露为缺口，而不是把整条基线悄悄降级。
+  // Evidence: 可产口径已由 analyzeRegion 的 probeRegionValuableItems 用 LP 判定（同 fail-closed 资源上限）。
+  // Replacement: 上方直接抛错（带基线目标条数）。
+  // Risk: Low —— 若后续资源预设漏登记，基线会从「静默降级」变为「显式报错」，属预期的数据校验信号。
+  // Human Review: Required
+  //
+  // Original code:
+  // let attempt = solveRegionLp(lpOptions, variables);
+  // if (attempt.solution.status !== "optimal" && lpOptions.targets.size > 0) {
+  //   attempt = solveRegionLp({ ...lpOptions, targets: new Map() }, variables);
+  // }
+  // if (attempt.solution.status !== "optimal") {
+  //   throw new Error(`区域线性规划未取得最优解：${attempt.solution.status}`);
+  // }
+  // const { build, deviceCounts } = attempt;
+  return toRegionSolve(index, attempt, lpOptions);
+}
+
+/** 把一次已取得最优解的 LP 结果折算为 RegionSolve；供 solvePlan 与可产性探测共用。 */
+function toRegionSolve(
+  index: ProductionPlanningIndex,
+  attempt: RegionLpResult,
+  lpOptions: Pick<RegionLpOptions, "valueByItemId">,
+): RegionSolve {
   const { build, deviceCounts } = attempt;
   const result = toProductionPlanningResult(
     build.variables,
@@ -567,17 +622,37 @@ function toValueMap(items: readonly RegionValuableItem[]): Map<string, number> {
   return values;
 }
 
+export interface RegionValuableProbe {
+  /** 本区能用区域资源池以正速率产出的券物品。 */
+  readonly producible: RegionValuableItem[];
+  /** 本区产不出的券物品（缺配方或缺资源），需跨区供给。 */
+  readonly gaps: RegionValuableItem[];
+  /** 可产物品的单位面积价值效率排名（降序）。 */
+  readonly valueRanking: ValueEfficiencyEntry[];
+}
+
 /**
- * 逐物品求解单条产线，得到单位面积价值效率排名（降序）。
- * 效率是「一条产线」的边际属性，与区域里有几个基地无关，因此固定用单基地变量求解，
- * 避免对每个物品都跑一次完整区域 LP。
+ * 逐物品探测「本区能否以正速率产出」，并对可产者给出单位面积价值效率排名（降序）。
+ *
+ * 判定方式：对每个券物品，用同一批单基地探针变量求解一次「目标 = 该物品净产出 ≥ 单机速率、
+ * 目标函数 = 面积最小」的 LP。可解即本区可产；`infeasible` 即缺口 —— 该判定与求解器共用同一套
+ * fail-closed 资源上限（见 lp/region-lp.ts 的 resolveExternalSupplyCap），因此「本区没有对应资源」
+ * 的物品必然不可解，而种植/采种这类自增殖环会被正确识别为可解。
+ *
+ * AI-CORRECTION 2026-10-01: 本函数取代了「按图可达性判定可产 + 单独跑排名」的两段式实现。
+ * 原因：图可达闭包会把「种植机(种子+清水→作物) + 采种机(作物→种子)」这类净产出为正的自增殖环
+ *   判成不可达（环内物品的图入边都不在源集合里），武陵因此丢掉 6 种券物品的基线保底；
+ *   而可产性本就是线性可行性问题，用求解器判定才准确。
+ * 新行为：一次探测同时产出「可产 / 缺口 / 单位面积价值排名」，且不可产物品不再进入排名
+ *   （旧实现会为不可产物品解出零设备的退化解，使 valuePerArea 变成 +Infinity 排到榜首）。
+ * 风险：探测次数由「可产物品数」变为「全部券物品数」（本次两个地区各 12/14 次），单次求解规模不变。
  */
-export function computeValueEfficiencyRanking(
+export function probeRegionValuableItems(
   index: ProductionPlanningIndex,
-  producible: readonly RegionValuableItem[],
+  valuable: readonly RegionValuableItem[],
   options: RegionProductionOptions,
   shared: Omit<RegionLpOptions, "targets" | "objective">,
-): ValueEfficiencyEntry[] {
+): RegionValuableProbe {
   const probeBaseId = "__efficiency__";
   const probeVariables = buildRegionLpVariables(
     index,
@@ -588,14 +663,24 @@ export function computeValueEfficiencyRanking(
     ...shared,
     baseAreaBudget: new Map([[probeBaseId, EFFICIENCY_AREA_BUDGET]]),
   };
+  const producible: RegionValuableItem[] = [];
+  const gaps: RegionValuableItem[] = [];
   const entries: ValueEfficiencyEntry[] = [];
-  for (const item of producible) {
+  for (const item of valuable) {
     const rate = Math.max(computeItemDefaultPerMinute(item.itemId, index), options.targetPerMinute);
-    const solved = solvePlan(index, probeVariables, {
-      ...probeShared,
-      targets: new Map([[item.itemId, rate]]),
-      objective: "area",
-    });
+    const attempt = solveRegionLp(
+      { ...probeShared, targets: new Map([[item.itemId, rate]]), objective: "area" },
+      probeVariables,
+    );
+    if (attempt.solution.status === "infeasible") {
+      gaps.push(item);
+      continue;
+    }
+    if (attempt.solution.status !== "optimal") {
+      throw new Error(`可产性探测未取得结论：${item.itemId} ${attempt.solution.status}`);
+    }
+    producible.push(item);
+    const solved = toRegionSolve(index, attempt, shared);
     const deviceArea = solved.plan.metrics.deviceArea;
     const areaPerUnitPerMinute = deviceArea / rate;
     const valuePerMinute = rate * item.value;
@@ -613,8 +698,71 @@ export function computeValueEfficiencyRanking(
       machineUsages: solved.plan.metrics.machineUsages,
     });
   }
-  return entries.sort((left, right) => right.valuePerArea - left.valuePerArea);
+  return {
+    producible,
+    gaps,
+    valueRanking: entries.sort((left, right) => right.valuePerArea - left.valuePerArea),
+  };
 }
+
+// AI-REMOVED 2026-10-01:
+// Reason: 该函数只负责「可产物品的单位面积价值排名」，可产性由调用方另行静态判定；两者合并后
+//   可产性改由 LP 可行性给出，该独立入口不再需要。
+// Trigger: 用户要求「按区域资源裁剪配方」，静态可产判定被证明不可靠（见上方 probeRegionValuableItems）。
+// Evidence: .temp/.trash/region-probe2/ 下 diag.mjs / diag-item.mjs 实测。
+// Replacement: 上方 probeRegionValuableItems。
+// Risk: Low
+// Human Review: Required
+//
+// Original code:
+// /**
+//  * 逐物品求解单条产线，得到单位面积价值效率排名（降序）。
+//  * 效率是「一条产线」的边际属性，与区域里有几个基地无关，因此固定用单基地变量求解，
+//  * 避免对每个物品都跑一次完整区域 LP。
+//  */
+// export function computeValueEfficiencyRanking(
+//   index: ProductionPlanningIndex,
+//   producible: readonly RegionValuableItem[],
+//   options: RegionProductionOptions,
+//   shared: Omit<RegionLpOptions, "targets" | "objective">,
+// ): ValueEfficiencyEntry[] {
+//   const probeBaseId = "__efficiency__";
+//   const probeVariables = buildRegionLpVariables(
+//     index,
+//     probeBaseId,
+//     options.sourceConfig.waterPurifierPolicy === "use-when-available",
+//   );
+//   const probeShared = {
+//     ...shared,
+//     baseAreaBudget: new Map([[probeBaseId, EFFICIENCY_AREA_BUDGET]]),
+//   };
+//   const entries: ValueEfficiencyEntry[] = [];
+//   for (const item of producible) {
+//     const rate = Math.max(computeItemDefaultPerMinute(item.itemId, index), options.targetPerMinute);
+//     const solved = solvePlan(index, probeVariables, {
+//       ...probeShared,
+//       targets: new Map([[item.itemId, rate]]),
+//       objective: "area",
+//     });
+//     const deviceArea = solved.plan.metrics.deviceArea;
+//     const areaPerUnitPerMinute = deviceArea / rate;
+//     const valuePerMinute = rate * item.value;
+//     entries.push({
+//       itemId: item.itemId,
+//       name: lookupRegistryText(item.nameKey),
+//       value: item.value,
+//       perMinute: rate,
+//       deviceArea,
+//       areaPerUnitPerMinute,
+//       deviceCount: solved.plan.metrics.totalDeviceCountCeil,
+//       powerDemandPerTick: solved.plan.metrics.powerDemandPerTick,
+//       valuePerMinute,
+//       valuePerArea: deviceArea > EPSILON ? valuePerMinute / deviceArea : Number.POSITIVE_INFINITY,
+//       machineUsages: solved.plan.metrics.machineUsages,
+//     });
+//   }
+//   return entries.sort((left, right) => right.valuePerArea - left.valuePerArea);
+// }
 
 /** 对比基线与最优计划的净产出差，给出「剩余产能追加的高价值产线」。 */
 function resolveOverflow(
@@ -721,7 +869,6 @@ export function analyzeRegion(
   // 只保留当前求解范围内存在的物品：活动限定物品默认不在建模范围内，不应被误报为「缺口」。
   const valuable = resolveRegionValuableItems(registry, referenceBase)
     .filter((item) => index.itemById.has(item.itemId));
-  const { producible, gaps } = resolveProducibleValuableItems(index, valuable);
   const valueByItemId = toValueMap(valuable);
 
   const variables: RegionLpVariable[] = [];
@@ -733,14 +880,14 @@ export function analyzeRegion(
   }
 
   const shared = buildSharedLpOptions(index, options, valueByItemId, baseAreaBudget);
+  // 可产判定必须先于基线目标：本区产不出的券物品不进基线，否则基线必然不可行（见 probeRegionValuableItems）。
+  const { producible, gaps, valueRanking } = probeRegionValuableItems(index, valuable, options, shared);
   const baselineTargets = toRateMap(producible, options.targetPerMinute);
 
   const allResource = solveBaselinePlan(index, variables, {
     ...shared,
     targets: baselineTargets,
   });
-
-  const valueRanking = computeValueEfficiencyRanking(index, producible, options, shared);
 
   const maxValueSolve = solveMaxValuePlan(index, variables, {
     ...shared,
